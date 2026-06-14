@@ -13,9 +13,12 @@ const groq = new Groq({
 
 /**
  * Categorize a customer support message using Groq AI
- * 
+ *
+ * Returns a structured triage object instead of freeform text so the rest of
+ * the app can rely on consistent fields.
+ *
  * @param {string} message - The customer support message
- * @returns {Promise<{category: string, reasoning: string}>}
+ * @returns {Promise<{category: string, urgency: string, route: string, confidence: number, reasoning: string, recommendedAction: string}>}
  */
 export async function categorizeMessage(message) {
   try {
@@ -23,37 +26,170 @@ export async function categorizeMessage(message) {
       model: "llama-3.3-70b-versatile",
       messages: [
         {
+          role: "system",
+          content: `You are an AI customer support triage assistant. Analyze the customer message and respond with a SINGLE JSON object ONLY. Do not include markdown, code fences, or any text outside the JSON.
+
+The JSON must match this exact schema:
+{
+  "category": "Billing Issue | Technical Problem | Feature Request | General Inquiry | Positive Feedback | Human Review",
+  "secondaryCategory": "null OR one of the category values",
+  "urgency": "High | Medium | Low",
+  "route": "Billing Team | Technical Support | Product Team | Customer Success | Human Review",
+  "confidence": 0.0,
+  "reasoning": "short explanation",
+  "recommendedAction": "next step"
+}
+
+Rules:
+- "category" must be exactly one of the listed values.
+- "route" must be exactly one of the listed values and should align with the category: Billing Issue -> Billing Team, Technical Problem -> Technical Support, Feature Request -> Product Team, Positive Feedback -> Customer Success, General Inquiry -> Customer Success, Human Review -> Human Review.
+- "urgency" reflects business impact and time-sensitivity (outages, double charges, refunds are High; suggestions and thanks are Low).
+- "confidence" is a number between 0 and 1 describing how certain you are.
+- "reasoning" is one or two short sentences.
+- "recommendedAction" is the concrete next step for the assigned team.
+- Multi-issue handling: if the message contains more than one distinct issue type (for example both Billing Issue and Technical Problem), set "category" to the most important issue, set "secondaryCategory" to the second issue, set "route" to "Human Review", set "confidence" to 0.75, and make "reasoning" explain that the message contains multiple issue types.
+- If the message contains only a single issue type, set "secondaryCategory" to null.
+- Return JSON only.`
+        },
+        {
           role: "user",
-          content: `Categorize this customer support message: ${message}`
+          content: message
         }
       ],
-      temperature: 0.7,
+      temperature: 0.2,
+      response_format: { type: "json_object" },
     });
 
     const content = response.choices[0].message.content;
-    
-    const lines = content.split('\n');
-    let category = "Unknown";
-    let reasoning = content;
-    
-    if (content.toLowerCase().includes('billing')) {
-      category = "Billing Issue";
-    } else if (content.toLowerCase().includes('technical') || content.toLowerCase().includes('bug')) {
-      category = "Technical Problem";
-    } else if (content.toLowerCase().includes('feature')) {
-      category = "Feature Request";
-    } else if (content.toLowerCase().includes('inquiry') || content.toLowerCase().includes('question')) {
-      category = "General Inquiry";
-    }
-    
-    return {
-      category,
-      reasoning: content
-    };
+    const parsed = JSON.parse(content);
+
+    return normalizeTriage(parsed, message);
   } catch (error) {
     console.warn('Groq API failed, using mock response:', error.message);
     return getMockCategorization(message);
   }
+}
+
+/**
+ * Validate and fill in any missing fields on the model's structured output,
+ * falling back to the rule-based mock for anything the model omitted.
+ */
+function normalizeTriage(parsed, message) {
+  const fallback = getMockCategorization(message);
+  const data = parsed && typeof parsed === 'object' ? parsed : {};
+
+  let confidence = Number(data.confidence);
+  if (!Number.isFinite(confidence)) {
+    confidence = fallback.confidence;
+  }
+  confidence = Math.min(1, Math.max(0, confidence));
+
+  const category = data.category || fallback.category;
+  const secondaryCategory = sanitizeSecondary(data.secondaryCategory, category);
+
+  const result = {
+    category,
+    secondaryCategory,
+    urgency: data.urgency || fallback.urgency,
+    route: data.route || fallback.route,
+    confidence,
+    reasoning: data.reasoning || fallback.reasoning,
+    recommendedAction: data.recommendedAction || fallback.recommendedAction,
+  };
+
+  // Enforce multi-issue rules consistently, regardless of what the model returned.
+  if (secondaryCategory) {
+    result.route = "Human Review";
+    result.confidence = 0.75;
+    result.reasoning = `This message contains multiple issue types (${category} and ${secondaryCategory}). Routing to Human Review so a person can address both.`;
+  }
+
+  return result;
+}
+
+/**
+ * Returns a valid secondary category string, or null when the model did not
+ * report a meaningful second issue.
+ */
+function sanitizeSecondary(value, category) {
+  if (!value || typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const lowered = trimmed.toLowerCase();
+  if (lowered === 'none' || lowered === 'n/a' || lowered === 'null') return null;
+  if (trimmed === category) return null;
+  return trimmed;
+}
+
+/**
+ * Default routing, urgency and recommended action per category, used so the
+ * mock fallback can produce the same structured shape as the AI response.
+ */
+const ROUTE_BY_CATEGORY = {
+  "Billing Issue": "Billing Team",
+  "Technical Problem": "Technical Support",
+  "Feature Request": "Product Team",
+  "Positive Feedback": "Customer Success",
+  "General Inquiry": "Customer Success",
+  "Human Review": "Human Review",
+};
+
+const URGENCY_BY_CATEGORY = {
+  "Billing Issue": "High",
+  "Technical Problem": "High",
+  "Feature Request": "Low",
+  "Positive Feedback": "Low",
+  "General Inquiry": "Medium",
+  "Human Review": "Medium",
+};
+
+const ACTION_BY_CATEGORY = {
+  "Billing Issue": "Route to the Billing Team to review the charges and process any refund.",
+  "Technical Problem": "Escalate to Technical Support to investigate and restore service.",
+  "Feature Request": "Share with the Product Team for roadmap consideration.",
+  "Positive Feedback": "Forward to Customer Success to acknowledge and thank the customer.",
+  "General Inquiry": "Respond with the relevant FAQ or knowledge-base link.",
+  "Human Review": "Flag for manual human review.",
+};
+
+/**
+ * Build a complete structured triage object from a single detected category.
+ */
+function buildTriage(category, reasoning, confidence) {
+  return {
+    category,
+    secondaryCategory: null,
+    urgency: URGENCY_BY_CATEGORY[category] || "Medium",
+    route: ROUTE_BY_CATEGORY[category] || "Human Review",
+    confidence,
+    reasoning,
+    recommendedAction: ACTION_BY_CATEGORY[category] || "Review manually.",
+  };
+}
+
+const URGENCY_RANK = { High: 3, Medium: 2, Low: 1 };
+
+/**
+ * Pick the more severe of two urgency levels.
+ */
+function mostUrgent(a, b) {
+  return (URGENCY_RANK[a] || 0) >= (URGENCY_RANK[b] || 0) ? a : b;
+}
+
+/**
+ * Build a structured triage object for a message that contains more than one
+ * issue type. These are always sent to Human Review with reduced confidence.
+ */
+function buildMultiIssueTriage(primary, secondary) {
+  return {
+    category: primary,
+    secondaryCategory: secondary,
+    urgency: mostUrgent(URGENCY_BY_CATEGORY[primary], URGENCY_BY_CATEGORY[secondary]),
+    route: "Human Review",
+    confidence: 0.75,
+    reasoning: `This message contains multiple issue types (${primary} and ${secondary}). Routing to Human Review so a person can address both.`,
+    recommendedAction: "Route to Human Review to triage and resolve both issues with the appropriate teams.",
+  };
 }
 
 /**
@@ -102,64 +238,66 @@ function getMockCategorization(message) {
   };
   
   // Billing-related detection
-  if (lowerMessage.includes('bill') || lowerMessage.includes('payment') || 
+  const isBilling = lowerMessage.includes('bill') || lowerMessage.includes('payment') || 
       lowerMessage.includes('charge') || lowerMessage.includes('invoice') ||
       lowerMessage.includes('credit card') || lowerMessage.includes('subscription') ||
-      lowerMessage.includes('refund') || lowerMessage.includes('cancel') && lowerMessage.includes('account')) {
-    return {
-      category: "Billing Issue",
-      reasoning: getRandomReasoning('billing')
-    };
-  }
+      lowerMessage.includes('refund') || lowerMessage.includes('cancel') && lowerMessage.includes('account');
   
   // Technical problem detection
-  if (lowerMessage.includes('bug') || lowerMessage.includes('error') || 
+  const isTechnical = lowerMessage.includes('bug') || lowerMessage.includes('error') || 
       lowerMessage.includes('broken') || lowerMessage.includes('not working') ||
       lowerMessage.includes('crash') || lowerMessage.includes('down') || 
       lowerMessage.includes('server') || lowerMessage.includes('loading') ||
       lowerMessage.includes('slow') || lowerMessage.includes('issue') ||
-      lowerMessage.includes('problem') && !lowerMessage.includes('no problem')) {
-    return {
-      category: "Technical Problem",
-      reasoning: getRandomReasoning('technical')
-    };
-  }
+      lowerMessage.includes('problem') && !lowerMessage.includes('no problem');
   
   // Feature request detection
-  if (lowerMessage.includes('feature') || lowerMessage.includes('add') && (lowerMessage.includes('please') || lowerMessage.includes('could')) ||
+  const isFeature = lowerMessage.includes('feature') ||
+      lowerMessage.includes('add') && (lowerMessage.includes('please') || lowerMessage.includes('could') || lowerMessage.includes('can you')) ||
+      lowerMessage.includes('dark mode') ||
       lowerMessage.includes('improve') || lowerMessage.includes('would like to see') ||
       lowerMessage.includes('suggestion') || lowerMessage.includes('wish') ||
       lowerMessage.includes('could you') && lowerMessage.includes('add') ||
-      lowerMessage.includes('enhancement') || lowerMessage.includes('would be great')) {
-    return {
-      category: "Feature Request",
-      reasoning: getRandomReasoning('feature')
-    };
-  }
+      lowerMessage.includes('enhancement') || lowerMessage.includes('would be great');
   
   // Positive feedback detection
-  if ((lowerMessage.includes('thank') || lowerMessage.includes('thanks') || lowerMessage.includes('appreciate')) &&
-      !lowerMessage.includes('but') && !lowerMessage.includes('however')) {
-    return {
-      category: "General Inquiry",
-      reasoning: getRandomReasoning('positive')
-    };
-  }
+  const isPositive = (lowerMessage.includes('thank') || lowerMessage.includes('thanks') || lowerMessage.includes('appreciate')) &&
+      !lowerMessage.includes('but') && !lowerMessage.includes('however');
   
   // Question/inquiry detection
-  if (lowerMessage.includes('how') || lowerMessage.includes('what') || 
+  const isInquiry = lowerMessage.includes('how') || lowerMessage.includes('what') || 
       lowerMessage.includes('when') || lowerMessage.includes('where') ||
       lowerMessage.includes('can i') || lowerMessage.includes('is there') ||
-      lowerMessage.includes('?')) {
-    return {
-      category: "General Inquiry",
-      reasoning: getRandomReasoning('inquiry')
-    };
+      lowerMessage.includes('?');
+  
+  // Collect detected issue types in priority order (most important first).
+  const detectedIssues = [];
+  if (isBilling) detectedIssues.push("Billing Issue");
+  if (isTechnical) detectedIssues.push("Technical Problem");
+  if (isFeature) detectedIssues.push("Feature Request");
+  
+  // Multi-issue: more than one distinct issue type -> route to Human Review.
+  if (detectedIssues.length >= 2) {
+    return buildMultiIssueTriage(detectedIssues[0], detectedIssues[1]);
+  }
+  
+  // Single-issue / existing behavior.
+  if (isBilling) {
+    return buildTriage("Billing Issue", getRandomReasoning('billing'), 0.85);
+  }
+  if (isTechnical) {
+    return buildTriage("Technical Problem", getRandomReasoning('technical'), 0.85);
+  }
+  if (isFeature) {
+    return buildTriage("Feature Request", getRandomReasoning('feature'), 0.8);
+  }
+  if (isPositive) {
+    return buildTriage("Positive Feedback", getRandomReasoning('positive'), 0.85);
+  }
+  if (isInquiry) {
+    return buildTriage("General Inquiry", getRandomReasoning('inquiry'), 0.6);
   }
   
   // Fallback for ambiguous messages
-  return {
-    category: "General Inquiry",
-    reasoning: getRandomReasoning('ambiguous')
-  };
+  return buildTriage("Human Review", getRandomReasoning('ambiguous'), 0.4);
 }

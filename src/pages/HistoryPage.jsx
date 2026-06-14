@@ -144,6 +144,30 @@ function HistoryPage() {
                         {item.message}
                       </div>
                     </div>
+                    {item.secondaryCategory && (
+                      <div>
+                        <div className="text-xs font-semibold text-gray-600 mb-1">Secondary Category</div>
+                        <div className="text-sm text-gray-800 bg-white p-3 rounded border border-gray-200">
+                          {item.secondaryCategory}
+                        </div>
+                      </div>
+                    )}
+                    {item.route && (
+                      <div>
+                        <div className="text-xs font-semibold text-gray-600 mb-1">Route</div>
+                        <div className="text-sm text-gray-800 bg-white p-3 rounded border border-gray-200">
+                          {item.route}
+                        </div>
+                      </div>
+                    )}
+                    {typeof item.confidence === 'number' && (
+                      <div>
+                        <div className="text-xs font-semibold text-gray-600 mb-1">Confidence</div>
+                        <div className="text-sm text-gray-800 bg-white p-3 rounded border border-gray-200">
+                          {Math.round(item.confidence * 100)}%
+                        </div>
+                      </div>
+                    )}
                     <div>
                       <div className="text-xs font-semibold text-gray-600 mb-1">Recommended Action</div>
                       <div className="text-sm text-gray-800 bg-purple-50 p-3 rounded border border-purple-200">

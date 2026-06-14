@@ -28,19 +28,25 @@ function AnalyzePage() {
     setResults(null)
     
     try {
-      // Run categorization (LLM call)
-      const { category, reasoning } = await categorizeMessage(message)
-      
-      // Calculate urgency (rule-based)
-      const urgency = calculateUrgency(message)
-      
-      // Get recommended action (template-based)
-      const recommendedAction = getRecommendedAction(category)
-      
+      // Run structured triage (LLM call). Falls back to rule-based helpers
+      // for any field the model does not provide.
+      const triage = await categorizeMessage(message)
+
+      const category = triage.category
+      const secondaryCategory = triage.secondaryCategory || null
+      const urgency = triage.urgency || calculateUrgency(message)
+      const route = triage.route
+      const confidence = triage.confidence
+      const reasoning = triage.reasoning
+      const recommendedAction = triage.recommendedAction || getRecommendedAction(category)
+
       const analysisResult = {
         message,
         category,
+        secondaryCategory,
         urgency,
+        route,
+        confidence,
         recommendedAction,
         reasoning,
         timestamp: new Date().toISOString()
@@ -137,6 +143,24 @@ function AnalyzePage() {
                 </div>
               </div>
 
+              {results.secondaryCategory && (
+                <div>
+                  <div className="text-sm font-semibold text-gray-600 mb-1">Secondary Category</div>
+                  <div className="inline-block bg-blue-100 text-blue-800 px-4 py-2 rounded-lg font-semibold">
+                    {results.secondaryCategory}
+                  </div>
+                </div>
+              )}
+
+              {results.route && (
+                <div>
+                  <div className="text-sm font-semibold text-gray-600 mb-1">Route</div>
+                  <div className="inline-block bg-indigo-100 text-indigo-800 px-4 py-2 rounded-lg font-semibold">
+                    {results.route}
+                  </div>
+                </div>
+              )}
+
               <div>
                 <div className="text-sm font-semibold text-gray-600 mb-1">Urgency Level</div>
                 <div className={`inline-block px-4 py-2 rounded-lg font-semibold ${
@@ -147,6 +171,15 @@ function AnalyzePage() {
                   {results.urgency}
                 </div>
               </div>
+
+              {typeof results.confidence === 'number' && (
+                <div>
+                  <div className="text-sm font-semibold text-gray-600 mb-1">Confidence</div>
+                  <div className="inline-block bg-gray-100 text-gray-800 px-4 py-2 rounded-lg font-semibold">
+                    {Math.round(results.confidence * 100)}%
+                  </div>
+                </div>
+              )}
 
               <div>
                 <div className="text-sm font-semibold text-gray-600 mb-1">Recommended Action</div>
@@ -170,7 +203,7 @@ function AnalyzePage() {
             <div className="mt-6 pt-4 border-t border-gray-200">
               <button
                 onClick={() => {
-                  const text = `Category: ${results.category}\nUrgency: ${results.urgency}\nRecommendation: ${results.recommendedAction}\n\nReasoning: ${results.reasoning}`
+                  const text = `Category: ${results.category}${results.secondaryCategory ? `\nSecondary Category: ${results.secondaryCategory}` : ''}\nRoute: ${results.route}\nUrgency: ${results.urgency}\nConfidence: ${typeof results.confidence === 'number' ? Math.round(results.confidence * 100) + '%' : 'N/A'}\nRecommendation: ${results.recommendedAction}\n\nReasoning: ${results.reasoning}`
                   navigator.clipboard.writeText(text)
                   alert('Results copied to clipboard!')
                 }}
